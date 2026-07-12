@@ -1,0 +1,10 @@
+# .NET (desktop-companion root)
+bin/
+obj/
+
+# Flutter (nested in calc_remote)
+calc_remote/.dart_tool/
+calc_remote/build/
+calc_remote/.flutter-plugin-dependencies
+calc_remote/android/.gradle/
+calc_remote/android/app/build/
