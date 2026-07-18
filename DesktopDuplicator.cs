@@ -24,7 +24,8 @@ public sealed class DesktopDuplicator : IDisposable
     public int Height { get; private set; }
     public int Left { get; private set; }
     public int Top { get; private set; }
-
+    private DateTime _lastReinitAttempt = DateTime.MinValue;
+    private static readonly TimeSpan ReinitRetryInterval = TimeSpan.FromSeconds(1);
     public DesktopDuplicator()
     {
         Initialize();
@@ -88,7 +89,7 @@ public sealed class DesktopDuplicator : IDisposable
                 adapter,
                 DriverType.Unknown,
                 DeviceCreationFlags.BgraSupport,
-                null,
+                null!,
                 out device,
                 out context);
 
@@ -134,6 +135,16 @@ public sealed class DesktopDuplicator : IDisposable
         bgraData = Array.Empty<byte>();
         stride = 0;
         dirtyBounds = Rectangle.Empty;
+
+        if (_duplication == null)
+        {
+            if (DateTime.UtcNow - _lastReinitAttempt < ReinitRetryInterval)
+                return false; // don't hammer retries -- wait a beat
+
+            _lastReinitAttempt = DateTime.UtcNow;
+            Reinitialize();
+            if (_duplication == null) return false;
+        }
 
         var result = _duplication.AcquireNextFrame((uint)timeoutMs, out OutduplFrameInfo frameInfo, out IDXGIResource? desktopResource);
 
@@ -268,7 +279,21 @@ public sealed class DesktopDuplicator : IDisposable
         try { _context?.Dispose(); } catch { /* best effort */ }
         try { _device?.Dispose(); } catch { /* best effort */ }
 
-        Initialize();
+        _duplication = null!;
+        _context = null!;
+        _device = null!;
+
+        try
+        {
+            Initialize();
+        }
+        catch (Exception ex)
+        {
+            // Most commonly: an exclusive-fullscreen app currently owns the
+            // output. Don't crash the capture loop -- just stay "not ready"
+            // and let TryCaptureFrame retry on a cooldown until it frees up.
+            Console.WriteLine($"    [i] Duplication unavailable, will retry: {ex.Message.Trim()}");
+        }
     }
 
     public void Dispose()
