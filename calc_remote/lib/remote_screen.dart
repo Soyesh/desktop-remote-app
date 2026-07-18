@@ -29,8 +29,6 @@ class _RemoteScreenState extends State<RemoteScreen> {
   final _keyboardFocus = FocusNode();
   String _lastKeyboardValue = '';
 
-  Timer? _scrollTimer;
-
   // ---- Pointer/gesture state -----------------------------------------
   // We use a raw Listener instead of a GestureDetector with combined
   // Tap+DoubleTap+Pan+LongPress recognizers. Combining all of those on one
@@ -135,7 +133,6 @@ class _RemoteScreenState extends State<RemoteScreen> {
     _client.dispose();
     _keyboardController.dispose();
     _keyboardFocus.dispose();
-    _scrollTimer?.cancel();
     _longPressTimer?.cancel();
     _tapTimer?.cancel();
     _canvasImage?.dispose();
@@ -429,19 +426,6 @@ class _RemoteScreenState extends State<RemoteScreen> {
 
   // -----------------------------------------------------------------------
 
-  void _startScrolling(int direction) {
-    // direction: +1 = up, -1 = down. Fire immediately, then repeat while held.
-    _client.scroll(direction * 120);
-    _scrollTimer?.cancel();
-    _scrollTimer = Timer.periodic(const Duration(milliseconds: 150), (_) {
-      _client.scroll(direction * 120);
-    });
-  }
-
-  void _stopScrolling() {
-    _scrollTimer?.cancel();
-    _scrollTimer = null;
-  }
 
   void _openKeyboard() {
     _keyboardController.text = '';
@@ -581,9 +565,9 @@ class _RemoteScreenState extends State<RemoteScreen> {
             onPointerUp: _onPointerUp,
             onPointerCancel: _onPointerCancel,
             child: Transform(
-              transform: Matrix4.identity()
-                ..translate(_viewOffset.dx, _viewOffset.dy)
-                ..scale(_viewScale),
+                transform: Matrix4.identity()
+                  ..translateByDouble(_viewOffset.dx, _viewOffset.dy, 0, 1)
+                  ..scaleByDouble(_viewScale, _viewScale, _viewScale, 1),
               child: CustomPaint(
                 painter: _CanvasPainter(_canvasImage),
                 size: Size.infinite,
