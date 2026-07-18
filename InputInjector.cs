@@ -12,6 +12,14 @@ public static class InputInjector
     private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
     private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     private const uint MOUSEEVENTF_WHEEL = 0x0800;
+    private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+    private const int SM_XVIRTUALSCREEN = 76;
+    private const int SM_YVIRTUALSCREEN = 77;
+    private const int SM_CXVIRTUALSCREEN = 78;
+    private const int SM_CYVIRTUALSCREEN = 79;
+
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int nIndex);
 
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -72,17 +80,28 @@ public static class InputInjector
     }
 
     /// <summary>Moves the cursor. x/y are normalized 0..1 relative to the primary screen.</summary>
-    public static void MoveTo(double normX, double normY)
+    /// <summary>Moves the cursor. x/y are normalized 0..1 within the captured monitor's bounds.</summary>
+    public static void MoveTo(double normX, double normY, int captureLeft, int captureTop, int captureWidth, int captureHeight)
     {
-        int absX = (int)(Math.Clamp(normX, 0, 1) * 65535);
-        int absY = (int)(Math.Clamp(normY, 0, 1) * 65535);
+        int targetX = captureLeft + (int)Math.Round(Math.Clamp(normX, 0, 1) * captureWidth);
+        int targetY = captureTop + (int)Math.Round(Math.Clamp(normY, 0, 1) * captureHeight);
+
+        int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        int absX = (int)((double)(targetX - vLeft) / vWidth * 65535);
+        int absY = (int)((double)(targetY - vTop) / vHeight * 65535);
+
+        Console.WriteLine($"[MOVE] norm=({normX:F3},{normY:F3}) capture=({captureLeft},{captureTop},{captureWidth}x{captureHeight}) target=({targetX},{targetY}) virt=({vLeft},{vTop},{vWidth}x{vHeight}) abs=({absX},{absY})");
 
         var input = new INPUT
         {
             type = INPUT_MOUSE,
             U = new InputUnion
             {
-                mi = new MOUSEINPUT { dx = absX, dy = absY, dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE }
+                mi = new MOUSEINPUT { dx = absX, dy = absY, dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK }
             }
         };
         SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());

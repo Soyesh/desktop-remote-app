@@ -1,3 +1,4 @@
+using System.Drawing;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.Direct3D;
@@ -21,6 +22,8 @@ public sealed class DesktopDuplicator : IDisposable
 
     public int Width { get; private set; }
     public int Height { get; private set; }
+    public int Left { get; private set; }
+    public int Top { get; private set; }
 
     public DesktopDuplicator()
     {
@@ -95,7 +98,9 @@ public sealed class DesktopDuplicator : IDisposable
             var desc = output.Description;
             Width = desc.DesktopCoordinates.Right - desc.DesktopCoordinates.Left;
             Height = desc.DesktopCoordinates.Bottom - desc.DesktopCoordinates.Top;
-
+            Left = desc.DesktopCoordinates.Left;
+            Top = desc.DesktopCoordinates.Top;
+            
             _device = device;
             _context = context;
             _duplication = duplication;
@@ -115,17 +120,22 @@ public sealed class DesktopDuplicator : IDisposable
         }
     }
 
+    private bool _sentFirstFrame = false;
+
     /// <summary>
     /// Blocks (up to timeoutMs) until the next screen change, then returns the
-    /// raw BGRA32 pixel buffer. Returns false on timeout (screen hasn't
+    /// raw BGRA32 pixel buffer for the WHOLE screen, plus the bounding box of
+    /// what actually changed (dirtyBounds) so the caller only needs to encode
+    /// and send that smaller region. Returns false on timeout (screen hasn't
     /// changed -- not an error, just means there's nothing new to send).
     /// </summary>
-    public bool TryCaptureFrame(int timeoutMs, out byte[] bgraData, out int stride)
+    public bool TryCaptureFrame(int timeoutMs, out byte[] bgraData, out int stride, out Rectangle dirtyBounds)
     {
         bgraData = Array.Empty<byte>();
         stride = 0;
+        dirtyBounds = Rectangle.Empty;
 
-        var result = _duplication.AcquireNextFrame((uint)timeoutMs, out _, out IDXGIResource? desktopResource);
+        var result = _duplication.AcquireNextFrame((uint)timeoutMs, out OutduplFrameInfo frameInfo, out IDXGIResource? desktopResource);
 
         if (result.Failure)
         {
@@ -180,10 +190,76 @@ public sealed class DesktopDuplicator : IDisposable
                 _context.Unmap(staging, 0);
             }
 
+            if (!_sentFirstFrame)
+            {
+                // The very first frame after a connection needs to cover the
+                // whole screen, since the phone starts with a blank canvas.
+                dirtyBounds = new Rectangle(0, 0, Width, Height);
+                _sentFirstFrame = true;
+            }
+            else
+            {
+                dirtyBounds = ComputeDirtyBounds(frameInfo);
+            }
+
             _duplication.ReleaseFrame();
         }
 
         return true;
+    }
+
+    // Asks DXGI exactly which small regions of the screen changed since the
+    // last frame, instead of assuming the whole screen needs re-sending.
+    private Rectangle ComputeDirtyBounds(OutduplFrameInfo frameInfo)
+    {
+        if (frameInfo.TotalMetadataBufferSize == 0)
+            return Rectangle.Empty; // nothing changed (e.g. cursor-only move with no pixel change)
+
+        int minX = Width, minY = Height, maxX = 0, maxY = 0;
+        bool any = false;
+
+        var dirtyRectsBuffer = new Vortice.RawRect[256];
+        var dirtyBufferSizeBytes = (uint)(dirtyRectsBuffer.Length * Marshal.SizeOf<Vortice.RawRect>());
+        var dirtyResult = _duplication.GetFrameDirtyRects(dirtyBufferSizeBytes, dirtyRectsBuffer, out uint dirtyBytesUsed);
+        if (dirtyResult.Success)
+        {
+            int dirtyCount = (int)dirtyBytesUsed / Marshal.SizeOf<Vortice.RawRect>();
+            for (int i = 0; i < dirtyCount; i++)
+            {
+                var r = dirtyRectsBuffer[i];
+                minX = Math.Min(minX, r.Left);
+                minY = Math.Min(minY, r.Top);
+                maxX = Math.Max(maxX, r.Right);
+                maxY = Math.Max(maxY, r.Bottom);
+                any = true;
+            }
+        }
+
+        var moveRectsBuffer = new OutduplMoveRect[128];
+        var moveBufferSizeBytes = (uint)(moveRectsBuffer.Length * Marshal.SizeOf<OutduplMoveRect>());
+        var moveResult = _duplication.GetFrameMoveRects(moveBufferSizeBytes, moveRectsBuffer, out uint moveBytesUsed);
+        if (moveResult.Success)
+        {
+            int moveCount = (int)moveBytesUsed / Marshal.SizeOf<OutduplMoveRect>();
+            for (int i = 0; i < moveCount; i++)
+            {
+                var r = moveRectsBuffer[i].DestinationRect;
+                minX = Math.Min(minX, r.Left);
+                minY = Math.Min(minY, r.Top);
+                maxX = Math.Max(maxX, r.Right);
+                maxY = Math.Max(maxY, r.Bottom);
+                any = true;
+            }
+        }
+
+        if (!any) return Rectangle.Empty;
+
+        minX = Math.Max(0, minX);
+        minY = Math.Max(0, minY);
+        maxX = Math.Min(Width, maxX);
+        maxY = Math.Min(Height, maxY);
+
+        return Rectangle.FromLTRB(minX, minY, maxX, maxY);
     }
 
     private void Reinitialize()

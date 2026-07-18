@@ -29,7 +29,7 @@ app.Map("/ws", async context =>
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
     Console.WriteLine("[+] Phone connected.");
 
-    var (screenW, screenH) = InputInjector.GetScreenSize();
+    var (screenW, screenH) = ScreenCapture.GetScaledScreenSize();
     string screenInfo = JsonSerializer.Serialize(new { type = "screen_info", width = screenW, height = screenH });
     await socket.SendAsync(Encoding.UTF8.GetBytes(screenInfo), WebSocketMessageType.Text, true, CancellationToken.None);
 
@@ -37,8 +37,9 @@ app.Map("/ws", async context =>
 
     var sendTask = SendFramesLoop(socket, cts.Token);
     var receiveTask = ReceiveInputLoop(socket, cts.Token);
+    var caretTask = WatchTextInputFocusLoop(socket, cts.Token);
 
-    await Task.WhenAny(sendTask, receiveTask);
+    await Task.WhenAny(sendTask, receiveTask, caretTask);
     cts.Cancel();
     Console.WriteLine("[-] Phone disconnected.");
 });
@@ -55,12 +56,12 @@ async Task SendFramesLoop(WebSocket socket, CancellationToken token)
 {
     while (!token.IsCancellationRequested && socket.State == WebSocketState.Open)
     {
-        byte[]? jpeg;
+        byte[]? packet;
         try
         {
             // Blocks up to 200ms for the next screen change; returns null on
             // timeout (nothing changed) so we just loop and wait again.
-            jpeg = ScreenCapture.TryCaptureJpeg(timeoutMs: 200);
+            packet = ScreenCapture.TryCaptureFramePacket(timeoutMs: 200);
         }
         catch (Exception ex)
         {
@@ -68,11 +69,11 @@ async Task SendFramesLoop(WebSocket socket, CancellationToken token)
             break; // socket closed or capture failed; let the outer loop notice and clean up
         }
 
-        if (jpeg == null) continue;
+        if (packet == null) continue;
 
         try
         {
-            await socket.SendAsync(jpeg, WebSocketMessageType.Binary, true, token);
+            await socket.SendAsync(packet, WebSocketMessageType.Binary, true, token);
         }
         catch (Exception ex)
         {
@@ -80,6 +81,32 @@ async Task SendFramesLoop(WebSocket socket, CancellationToken token)
             break;
         }
     }
+}
+
+async Task WatchTextInputFocusLoop(WebSocket socket, CancellationToken token)
+{
+    Console.WriteLine("[CARET] Watch loop started");
+    bool lastActive = false;
+    while (!token.IsCancellationRequested && socket.State == WebSocketState.Open)
+    {
+        bool active = TextInputWatcher.IsTextInputActive();
+        Console.WriteLine($"[CARET] poll active={active}");
+        if (active != lastActive)
+        {
+            lastActive = active;
+            string msg = JsonSerializer.Serialize(new { type = "text_input_focus", active });
+            try
+            {
+                await socket.SendAsync(Encoding.UTF8.GetBytes(msg), WebSocketMessageType.Text, true, token);
+                Console.WriteLine($"[CARET] sent text_input_focus active={active}");
+            }
+            catch { break; }
+        }
+
+        try { await Task.Delay(250, token); }
+        catch (OperationCanceledException) { break; }
+    }
+    Console.WriteLine("[CARET] Watch loop exited");
 }
 
 async Task ReceiveInputLoop(WebSocket socket, CancellationToken token)
@@ -113,11 +140,12 @@ void HandleInput(string json)
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
         string type = root.GetProperty("type").GetString() ?? "";
-
+        Console.WriteLine($"[RECV] type={type}");
         switch (type)
         {
             case "mouse_move":
-                InputInjector.MoveTo(root.GetProperty("x").GetDouble(), root.GetProperty("y").GetDouble());
+                var mb = ScreenCapture.GetCaptureBounds();
+                InputInjector.MoveTo(root.GetProperty("x").GetDouble(), root.GetProperty("y").GetDouble(), mb.left, mb.top, mb.width, mb.height);
                 break;
 
             case "mouse_move_relative":
@@ -139,6 +167,17 @@ void HandleInput(string json)
                 break;
 
             case "mouse_double_click":
+                InputInjector.DoubleClick(GetButton(root));
+                break;
+            
+            case "mouse_click_at":
+                var cb = ScreenCapture.GetCaptureBounds();
+                InputInjector.MoveTo(root.GetProperty("x").GetDouble(), root.GetProperty("y").GetDouble(), cb.left, cb.top, cb.width, cb.height);
+                InputInjector.Click(GetButton(root));
+                break;
+            case "mouse_double_click_at":
+                var dcb = ScreenCapture.GetCaptureBounds();
+                InputInjector.MoveTo(root.GetProperty("x").GetDouble(), root.GetProperty("y").GetDouble(), dcb.left, dcb.top, dcb.width, dcb.height);
                 InputInjector.DoubleClick(GetButton(root));
                 break;
 

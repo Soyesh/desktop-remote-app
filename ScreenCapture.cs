@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
 
 public static class ScreenCapture
@@ -28,52 +29,82 @@ public static class ScreenCapture
     private const int CURSOR_SHOWING = 0x00000001;
 
     private static readonly DesktopDuplicator Duplicator = new();
+    private const double Scale = 0.6;
 
     /// <summary>
-    /// Blocks (up to timeoutMs) until the screen changes, then returns a scaled
-    /// JPEG frame. Returns null on timeout -- caller should just try again;
-    /// there's nothing new to send.
+    /// Blocks (up to timeoutMs) until the screen changes, then returns a packet
+    /// containing ONLY the region that actually changed: a 16-byte header
+    /// (x, y, width, height as little-endian int32, in the SAME scaled
+    /// coordinate space reported by GetScaledScreenSize) followed by a JPEG of
+    /// just that region. Returns null if there's nothing worth sending yet.
     /// </summary>
-    public static byte[]? TryCaptureJpeg(int timeoutMs, int quality = 40, double scale = 0.6)
+    public static byte[]? TryCaptureFramePacket(int timeoutMs, int quality = 40)
     {
-        if (!Duplicator.TryCaptureFrame(timeoutMs, out byte[] bgraData, out int stride))
+        if (!Duplicator.TryCaptureFrame(timeoutMs, out byte[] bgraData, out int stride, out Rectangle dirty))
             return null;
 
-        int width = Duplicator.Width;
-        int height = Duplicator.Height;
+        if (dirty.Width <= 0 || dirty.Height <= 0)
+            return null;
+
+        int nativeWidth = Duplicator.Width;
+        int nativeHeight = Duplicator.Height;
 
         var handle = GCHandle.Alloc(bgraData, GCHandleType.Pinned);
         try
         {
-            using var fullBitmap = new Bitmap(width, height, stride, PixelFormat.Format32bppRgb, handle.AddrOfPinnedObject());
+            using var fullBitmap = new Bitmap(nativeWidth, nativeHeight, stride, PixelFormat.Format32bppRgb, handle.AddrOfPinnedObject());
 
-            using (var g = Graphics.FromImage(fullBitmap))
-            {
-                DrawCursor(g, new Rectangle(0, 0, width, height));
-            }
+            // Cursor intentionally not composited -- absolute-click UX doesn't need
+            // the desktop's local cursor rendered on the phone.
 
-            int scaledWidth = Math.Max(1, (int)(width * scale));
-            int scaledHeight = Math.Max(1, (int)(height * scale));
+            // Crop out just the region that changed, instead of re-encoding
+            // the whole screen every time -- this is the whole point.
+            using var cropped = fullBitmap.Clone(dirty, PixelFormat.Format24bppRgb);
 
-            using var scaledBitmap = new Bitmap(scaledWidth, scaledHeight, PixelFormat.Format24bppRgb);
-            using (var g = Graphics.FromImage(scaledBitmap))
+            int scaledW = Math.Max(1, (int)Math.Round(dirty.Width * Scale));
+            int scaledH = Math.Max(1, (int)Math.Round(dirty.Height * Scale));
+
+            using var scaledPatch = new Bitmap(scaledW, scaledH, PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(scaledPatch))
             {
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                g.DrawImage(fullBitmap, 0, 0, scaledWidth, scaledHeight);
+                g.DrawImage(cropped, 0, 0, scaledW, scaledH);
             }
 
             using var ms = new MemoryStream();
             var jpegEncoder = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
             var encoderParams = new EncoderParameters(1);
             encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)quality);
-            scaledBitmap.Save(ms, jpegEncoder, encoderParams);
+            scaledPatch.Save(ms, jpegEncoder, encoderParams);
+            byte[] jpegBytes = ms.ToArray();
 
-            return ms.ToArray();
+            int scaledX = (int)Math.Round(dirty.X * Scale);
+            int scaledY = (int)Math.Round(dirty.Y * Scale);
+
+            var packet = new byte[16 + jpegBytes.Length];
+            BitConverter.GetBytes(scaledX).CopyTo(packet, 0);
+            BitConverter.GetBytes(scaledY).CopyTo(packet, 4);
+            BitConverter.GetBytes(scaledW).CopyTo(packet, 8);
+            BitConverter.GetBytes(scaledH).CopyTo(packet, 12);
+            Buffer.BlockCopy(jpegBytes, 0, packet, 16, jpegBytes.Length);
+
+            return packet;
         }
         finally
         {
             handle.Free();
         }
+    }
+
+    /// <summary>The scaled canvas size the phone should allocate -- matches the coordinate space of every patch.</summary>
+    public static (int width, int height) GetScaledScreenSize()
+    {
+        return ((int)Math.Round(Duplicator.Width * Scale), (int)Math.Round(Duplicator.Height * Scale));
+    }
+
+    public static (int left, int top, int width, int height) GetCaptureBounds()
+    {
+        return (Duplicator.Left, Duplicator.Top, Duplicator.Width, Duplicator.Height);
     }
 
     // Desktop Duplication captures pixels only -- the OS cursor is composited by
